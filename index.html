@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AP Attendance System</title>
+    <!-- PWA Manifest file -->
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#800000"/>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Add this script to register the service worker -->
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/service-worker.js')
+            .then(registration => {
+              console.log('Service Worker registered with scope:', registration.scope);
+            })
+            .catch(error => {
+              console.log('Service Worker registration failed:', error);
+            });
+        });
+      }
+    </script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="module">
+        import { useState, useEffect, useRef } from 'https://esm.sh/react@18.2.0';
+        import { createRoot } from 'https://esm.sh/react-dom@18.2.0/client';
+        import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js';
+        import { getAuth, signInWithCustomToken, onAuthStateChanged, signInAnonymously } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js';
+        import { getFirestore, doc, addDoc, onSnapshot, collection, query, serverTimestamp, getDocs, deleteDoc, writeBatch, updateDoc } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js';
+
+        // Define the global Firebase variables
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : '';
+
+        // Function to handle exponential backoff for API calls
+        const fetchWithBackoff = async (func, retries = 5, delay = 1000) => {
+          try {
+            return await func();
+          } catch (error) {
+            if (error.code === 'resource-exhausted' && retries > 0) {
+              console.warn(`API call failed, retrying in ${delay / 1000}s...`);
+              await new Promise(resolve => setTimeout(resolve, delay));
+              return fetchWithBackoff(func, retries - 1, delay * 2);
+            }
+            throw error;
+          }
+        };
+
+        // Main App component
+        const App = () => {
+          const [db, setDb] = useState(null);
+          const [auth, setAuth] = useState(null);
+          const [userId, setUserId] = useState(null);
+          const [members, setMembers] = useState([]);
+          const [attendance, setAttendance] = useState([]);
+          const [newMemberName, setNewMemberName] = useState('');
+          const [newMemberRfid, setNewMemberRfid] = useState('');
+          const [newMemberVoice, setNewMemberVoice] = useState('Soprano');
+          const [rfidScanId, setRfidScanId] = useState('');
+          const [loading, setLoading] = useState(true);
+          const [message, setMessage] = useState('');
+          const [messageType, setMessageType] = useState('');
+          const [scannerMessage, setScannerMessage] = useState('');
+          const [scannerMessageType, setScannerMessageType] = useState('');
+          const [uploadFile, setUploadFile] = useState(null);
+          const [isProcessing, setIsProcessing] = useState(false);
+          const [isSummaryModalOpen, setIsSummaryModalOpen] = useState(false);
+          const [isConfirmModalOpen, setIsConfirmModalOpen] = useState(false);
+          const [isDatabaseModalOpen, setIsDatabaseModalOpen] = useState(false);
+          const [editingMemberId, setEditingMemberId] = useState(null);
+          const [editedName, setEditedName] = useState('');
+          const [editedRfid, setEditedRfid] = useState('');
+          const [editedVoice, setEditedVoice] = useState('');
+          const [lastScannedMember, setLastScannedMember] = useState(null);
+          const scanTimeoutRef = useRef(null);
+        
+          // Initialize Firebase and set up auth
+          useEffect(() => {
+            try {
+              const app = initializeApp(firebaseConfig);
+              const firestore = getFirestore(app);
+              const firebaseAuth = getAuth(app);
+              setDb(firestore);
+              setAuth(firebaseAuth);
+        
+              const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+                if (user) {
+                  setUserId(user.uid);
+                  setLoading(false);
+                } else {
+                  try {
+                    if (initialAuthToken) {
+                      await signInWithCustomToken(firebaseAuth, initialAuthToken);
+                    } else {
+                      await signInAnonymously(firebaseAuth);
+                    }
+                  } catch (error) {
+                    console.error("Firebase Auth Error:", error);
+                    setLoading(false);
+                  }
+                }
+              });
+              return () => unsubscribe();
+            } catch (error) {
+              console.error("Failed to initialize Firebase:", error);
+              setLoading(false);
+            }
+          }, []);
+        
+          // Set up real-time listeners for members and attendance
+          useEffect(() => {
+            if (db && userId) {
+              // --- CHANGED: Using a private collection path with the userId ---
+              const membersCollectionPath = `/artifacts/${appId}/users/${userId}/members`;
+              const membersRef = collection(db, membersCollectionPath);
+              const attendanceCollectionPath = `/artifacts/${appId}/users/${userId}/attendance`;
+              const attendanceRef = collection(db, attendanceCollectionPath);
+              // --- END CHANGED ---
+        
+              const unsubscribeMembers = onSnapshot(membersRef, (snapshot) => {
+                const memberList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                setMembers(memberList);
+              }, (error) => {
+                console.error("Error fetching members:", error);
+              });
+        
+              const unsubscribeAttendance = onSnapshot(query(attendanceRef), (snapshot) => {
+                const attendanceList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                setAttendance(attendanceList);
+              }, (error) => {
+                console.error("Error fetching attendance:", error);
+              });
+        
+              return () => {
+                unsubscribeMembers();
+                unsubscribeAttendance();
+              };
+            }
+          }, [db, userId]);
+        
+          // Function to show a temporary message in the main area
+          const showMessage = (msg, type) => {
+            setMessage(msg);
+            setMessageType(type);
+            setTimeout(() => {
+              setMessage('');
+              setMessageType('');
+            }, 4000);
+          };
+          
+          // Function to show a temporary message in the scanner section
+          const showScannerMessage = (msg, type) => {
+            setScannerMessage(msg);
+            setScannerMessageType(type);
+            setTimeout(() => {
+              setScannerMessage('');
+              setScannerMessageType('');
+            }, 4000);
+          };
+        
+          // Handle automatic RFID scan with a delay to ensure data is loaded
+          useEffect(() => {
+            if (db && rfidScanId) {
+              if (scanTimeoutRef.current) {
+                clearTimeout(scanTimeoutRef.current);
+              }
+              scanTimeoutRef.current = setTimeout(() => {
+                if (members.length === 0) {
+                    showScannerMessage("Database is still loading. Please try again in a moment.", 'error');
+                    setRfidScanId('');
+                    return;
+                }
+        
+                const member = members.find(s => s.rfidId === rfidScanId);
+                if (member) {
+                  // Only record attendance if not a duplicate
+                  if (!attendance.some(record => record.memberId === member.id)) {
+                      recordAttendance(member);
+                  } else {
+                      showScannerMessage(`${member.name} has already been scanned for this session.`, 'error');
+                      setRfidScanId('');
+                  }
+                } else {
+                  showScannerMessage(`RFID tag ID "${rfidScanId}" not found in the member database.`, 'error');
+                  setRfidScanId('');
+                }
+              }, 500); // 500ms delay after scan input
+        
+              return () => {
+                if (scanTimeoutRef.current) {
+                  clearTimeout(scanTimeoutRef.current);
+                }
+              };
+            }
+          }, [rfidScanId, members, attendance, db]);
+        
+          // Function to add a single member manually
+          const addMember = async () => {
+            if (!newMemberName || !newMemberRfid) {
+              showMessage('Please enter both member name and RFID tag ID.', 'error');
+              return;
+            }
+            if (members.some(s => s.rfidId === newMemberRfid)) {
+              showMessage(`A member with RFID ID "${newMemberRfid}" already exists.`, 'error');
+              return;
+            }
+            const memberData = {
+              name: newMemberName,
+              rfidId: newMemberRfid,
+              voice: newMemberVoice,
+              createdBy: userId,
+              createdAt: serverTimestamp(),
+            };
+        
+            try {
+              // --- CHANGED: Using a private collection path with the userId ---
+              await fetchWithBackoff(() => addDoc(collection(db, `/artifacts/${appId}/users/${userId}/members`), memberData));
+              // --- END CHANGED ---
+              setNewMemberName('');
+              setNewMemberRfid('');
+              showMessage('Member added successfully!', 'success');
+            } catch (e) {
+              console.error("Error adding member:", e);
+              showMessage('Failed to add member. Please try again.', 'error');
+            }
+          };
+        
+          // Function to handle CSV file upload
+          const handleFileUpload = async () => {
+            if (!uploadFile) {
+              showMessage('Please select a file to upload.', 'error');
+              return;
+            }
+            setIsProcessing(true);
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+              const text = e.target.result;
+              const lines = text.split('\n');
+              const headers = lines[0].trim().split(',').map(h => h.trim());
+              const rfidIndex = headers.indexOf('RFID');
+              const nameIndex = headers.indexOf('Name');
+              const voiceIndex = headers.indexOf('Voice');
+        
+              if (rfidIndex === -1 || nameIndex === -1) {
+                showMessage('CSV must contain "RFID" and "Name" headers. "Voice" is optional.', 'error');
+                setIsProcessing(false);
+                return;
+              }
+        
+              const membersToAdd = [];
+              for (let i = 1; i < lines.length; i++) {
+                const line = lines[i].trim();
+                if (line === '') continue;
+                const values = line.split(',');
+                if (values.length > Math.max(rfidIndex, nameIndex, voiceIndex) && values[rfidIndex] && values[nameIndex]) {
+                  membersToAdd.push({
+                    name: values[nameIndex].trim(),
+                    rfidId: values[rfidIndex].trim(),
+                    voice: voiceIndex !== -1 ? values[voiceIndex].trim() : 'Soprano',
+                    createdBy: userId,
+                    createdAt: serverTimestamp(),
+                  });
+                }
+              }
+        
+              // --- CHANGED: Using a private collection path with the userId ---
+              const membersCollectionRef = collection(db, `/artifacts/${appId}/users/${userId}/members`);
+              // --- END CHANGED ---
+              const batch = writeBatch(db);
+        
+              try {
+                const existingMembersSnapshot = await getDocs(membersCollectionRef);
+                const existingRfids = new Set(existingMembersSnapshot.docs.map(doc => doc.data().rfidId));
+                
+                membersToAdd.forEach(member => {
+                    if (!existingRfids.has(member.rfidId)) {
+                        batch.add(membersCollectionRef, member);
+                    }
+                });
+        
+                await fetchWithBackoff(() => batch.commit());
+                showMessage('Members imported successfully from file!', 'success');
+              } catch (e) {
+                console.error("Error importing members from file:", e);
+                showMessage('Failed to import members. Please check your file and try again.', 'error');
+              } finally {
+                setIsProcessing(false);
+                setUploadFile(null);
+              }
+            };
+            reader.readAsText(uploadFile);
+          };
+        
+          // Function to perform the new attendance session action
+          const performNewAttendance = async () => {
+            // --- CHANGED: Using a private collection path with the userId ---
+            const attendanceCollectionPath = `/artifacts/${appId}/users/${userId}/attendance`;
+            // --- END CHANGED ---
+            const attendanceRef = collection(db, attendanceCollectionPath);
+            const q = query(attendanceRef);
+            const querySnapshot = await getDocs(q);
+        
+            const batch = writeBatch(db);
+            querySnapshot.forEach((doc) => {
+                batch.delete(doc.ref);
+            });
+            await fetchWithBackoff(() => batch.commit());
+            showScannerMessage('New attendance session started. All previous records cleared.', 'success');
+            setIsConfirmModalOpen(false);
+          };
+        
+          // Function to record attendance
+          const recordAttendance = async (member) => {
+            const attendanceData = {
+              memberId: member.id,
+              memberName: member.name,
+              timestamp: serverTimestamp(),
+              scannedBy: userId,
+            };
+        
+            try {
+              // --- CHANGED: Using a private collection path with the userId ---
+              await fetchWithBackoff(() => addDoc(collection(db, `/artifacts/${appId}/users/${userId}/attendance`), attendanceData));
+              // --- END CHANGED ---
+              showScannerMessage(`Attendance recorded for ${member.name}!`, 'success');
+              setLastScannedMember({ name: member.name, voice: member.voice || 'N/A' });
+              setRfidScanId('');
+            } catch (e) {
+              console.error("Error recording attendance:", e);
+              showScannerMessage('Failed to record attendance. Please try again.', 'error');
+            }
+          };
+        
+          // Function to edit a member
+          const handleEditMember = (member) => {
+            setEditingMemberId(member.id);
+            setEditedName(member.name);
+            setEditedRfid(member.rfidId);
+            setEditedVoice(member.voice);
+          };
+        
+          // Function to save the edited member
+          const handleSaveMember = async (memberId) => {
+            if (!editedName || !editedRfid) {
+              showMessage('Member name and RFID cannot be empty.', 'error');
+              return;
+            }
+            // --- CHANGED: Using a private doc path with the userId ---
+            const memberDocRef = doc(db, `/artifacts/${appId}/users/${userId}/members`, memberId);
+            // --- END CHANGED ---
+            try {
+              await fetchWithBackoff(() => updateDoc(memberDocRef, {
+                name: editedName,
+                rfidId: editedRfid,
+                voice: editedVoice,
+              }));
+              setEditingMemberId(null);
+              showMessage('Member updated successfully!', 'success');
+            } catch (e) {
+              console.error("Error updating member:", e);
+              showMessage('Failed to update member.', 'error');
+            }
+          };
+        
+          // Function to delete a member
+          const handleDeleteMember = async (memberId) => {
+            // Using a custom modal instead of window.confirm
+            // (Note: The provided code uses window.confirm, so this is a placeholder comment for a more robust implementation)
+            // --- CHANGED: Using a private doc path with the userId ---
+            const memberDocRef = doc(db, `/artifacts/${appId}/users/${userId}/members`, memberId);
+            // --- END CHANGED ---
+            try {
+                await fetchWithBackoff(() => deleteDoc(memberDocRef));
+                showMessage('Member deleted successfully!', 'success');
+            } catch (e) {
+                console.error("Error deleting member:", e);
+                showMessage('Failed to delete member.', 'error');
+            }
+          };
+        
+          // Loading state
+          if (loading) {
+            return (
+              <div className="flex items-center justify-center min-h-screen bg-gray-100">
+                <div className="text-xl font-semibold text-gray-700">Initializing app...</div>
+              </div>
+            );
+          }
+        
+          const presentMembers = attendance.map(record => {
+            const member = members.find(m => m.id === record.memberId);
+            return member ? member.name : 'Unknown Member';
+          }).filter((value, index, self) => self.indexOf(value) === index);
+        
+          return (
+            <div className="min-h-screen bg-gray-100 p-8 font-sans antialiased text-gray-800">
+              <div className="container mx-auto max-w-6xl">
+                <header className="mb-8">
+                  <h1 className="text-4xl font-extrabold text-center text-red-800 mb-2">AP Attendance System</h1>
+                  <p className="text-center text-lg text-red-600">
+                    Current User ID: <span className="font-mono text-sm bg-red-200 text-red-800 rounded-md px-2 py-1">{userId}</span>
+                  </p>
+                </header>
+        
+                {/* Temporary message display for general actions */}
+                {message && (
+                  <div className={`p-4 rounded-xl mb-6 text-center text-white font-semibold transition-opacity duration-300 ${messageType === 'success' ? 'bg-green-500' : 'bg-red-500'}`}>
+                    {message}
+                  </div>
+                )}
+        
+                <main className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                  {/* Section 1: Add Member */}
+                  <section className="lg:col-span-1 bg-white p-6 rounded-2xl shadow-xl border border-gray-200">
+                    <h2 className="text-2xl font-bold text-red-600 mb-4">Add New Member</h2>
+                    
+                    {/* Manual Add Section */}
+                    <div className="space-y-3">
+                      <input
+                        type="text"
+                        placeholder="Member Name"
+                        value={newMemberName}
+                        onChange={(e) => setNewMemberName(e.target.value)}
+                        className="w-full p-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-red-500 focus:border-transparent transition"
+                      />
+                      <input
+                        type="text"
+                        placeholder="RFID Tag ID"
+                        value={newMemberRfid}
+                        onChange={(e) => setNewMemberRfid(e.target.value)}
+                        className="w-full p-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-red-500 focus:border-transparent transition"
+                      />
+                      <select
+                        value={newMemberVoice}
+                        onChange={(e) => setNewMemberVoice(e.target.value)}
+                        className="w-full p-2 rounded-lg border border-gray-300 bg-white focus:ring-2 focus:ring-red-500 focus:border-transparent transition"
+                      >
+                        <option value="Soprano">Soprano</option>
+                        <option value="Alto">Alto</option>
+                        <option value="Tenor">Tenor</option>
+                        <option value="Bass">Bass</option>
+                      </select>
+                      <button
+                        onClick={addMember}
+                        className="w-full p-2 bg-red-600 text-white font-semibold rounded-lg shadow-md hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 transition"
+                      >
+                        Add Member
+                      </button>
+                    </div>
+        
+                    <hr className="my-6" />
+                    
+                    {/* CSV Upload Section */}
+                    <div className="space-y-4">
+                        <p className="text-sm text-gray-600 font-semibold">
+                            Upload a CSV file to add members in bulk.
+                        </p>
+                        <div className="space-y-2">
+                            <input
+                                type="file"
+                                accept=".csv"
+                                onChange={(e) => setUploadFile(e.target.files[0])}
+                                className="flex-grow w-full p-2 text-sm text-gray-900 border border-gray-300 rounded-lg cursor-pointer bg-gray-50 focus:outline-none"
+                            />
+                            <button
+                                onClick={handleFileUpload}
+                                disabled={isProcessing}
+                                className="w-full p-2 bg-red-600 text-white font-semibold rounded-lg shadow-md hover:bg-red-700 disabled:bg-red-300 transition"
+                            >
+                                {isProcessing ? 'Processing...' : 'Upload'}
+                            </button>
+                        </div>
+                        <p className="text-xs text-gray-500 mt-2">
+                            **File Header Instructions:**
+                            <br />
+                            Your CSV file must have these headers:
+                            <br />
+                            <span className="font-mono bg-gray-200 rounded-md px-1">`Name`</span>, <span className="font-mono bg-gray-200 rounded-md px-1">`RFID`</span>, <span className="font-mono bg-gray-200 rounded-md px-1">`Voice`</span> (optional).
+                        </p>
+                    </div>
+        
+                    <button
+                        onClick={() => setIsDatabaseModalOpen(true)}
+                        className="mt-6 w-full p-2 bg-red-800 text-white font-semibold rounded-lg shadow-md hover:bg-red-900 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 transition"
+                    >
+                        View Database ({members.length})
+                    </button>
+                  </section>
+        
+                  {/* Section 2: RFID Scanner */}
+                  <section className="lg:col-span-2 bg-white p-6 rounded-2xl shadow-xl border border-gray-200 flex flex-col justify-between">
+                    <div>
+                        <h2 className="text-2xl font-bold text-red-600 mb-4">RFID Scanner Simulation</h2>
+                        
+                        {/* Scanner-specific message display */}
+                        {scannerMessage && (
+                          <div className={`p-2 rounded-lg mb-4 text-center text-white font-semibold ${scannerMessageType === 'success' ? 'bg-green-500' : 'bg-red-500'}`}>
+                            {scannerMessage}
+                          </div>
+                        )}
+                        
+                        {lastScannedMember ? (
+                            <div className="text-center my-8">
+                                <div className="text-5xl font-extrabold text-red-800 tracking-wide">{lastScannedMember.name}</div>
+                                <div className="text-xl font-medium text-gray-600 mt-2">({lastScannedMember.voice})</div>
+                            </div>
+                        ) : (
+                            <div className="text-center my-8 text-gray-400 text-lg italic">
+                                Awaiting first scan...
+                            </div>
+                        )}
+                    </div>
+        
+                    <div className="mt-auto">
+                        <div className="space-y-4 mb-6">
+                            <p className="text-gray-600">Enter an RFID tag ID to simulate a scan.</p>
+                            <input
+                            type="text"
+                            placeholder="Enter RFID Tag ID"
+                            value={rfidScanId}
+                            onChange={(e) => setRfidScanId(e.target.value)}
+                            className="w-full p-3 rounded-xl border border-gray-300 text-lg font-mono tracking-widest focus:ring-2 focus:ring-red-500 focus:border-transparent transition"
+                            />
+                        </div>
+        
+                        <div className="flex justify-center space-x-4 mb-6">
+                            <button
+                                onClick={() => setIsConfirmModalOpen(true)}
+                                className="px-6 py-3 bg-red-600 text-white font-semibold rounded-xl shadow-md hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 transition"
+                            >
+                                Make New Attendance
+                            </button>
+                            <button
+                                onClick={() => setIsSummaryModalOpen(true)}
+                                className="px-6 py-3 bg-gray-600 text-white font-semibold rounded-xl shadow-md hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 transition"
+                            >
+                                View Summary
+                            </button>
+                        </div>
+                        
+                        <div className="mt-6 border-t border-gray-200 pt-6">
+                            <h3 className="text-2xl font-bold text-gray-700 mb-3">Attendance Records ({attendance.length})</h3>
+                            <ul className="space-y-2 max-h-48 overflow-y-auto pr-2">
+                                {attendance.map(record => (
+                                    <li key={record.id} className="bg-gray-50 p-4 rounded-xl border border-gray-100 flex items-center space-x-4">
+                                        <span className="text-3xl">✅</span>
+                                        <div>
+                                            <div className="font-semibold text-gray-900">{record.memberName}</div>
+                                            <div className="text-sm text-gray-500">
+                                                Timestamp: {record.timestamp?.toDate().toLocaleString() || 'N/A'}
+                                            </div>
+                                        </div>
+                                    </li>
+                                ))}
+                            </ul>
+                        </div>
+                    </div>
+                  </section>
+                </main>
+              </div>
+        
+              {/* Confirmation Modal */}
+              {isConfirmModalOpen && (
+                <div className="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full flex items-center justify-center">
+                  <div className="relative bg-white p-8 rounded-2xl shadow-2xl text-center max-w-sm mx-auto">
+                    <h3 className="text-2xl font-bold text-red-700 mb-4">Confirm Action</h3>
+                    <p className="text-gray-700 mb-6">Are you sure you want to clear all current attendance records and start a new session?</p>
+                    <div className="flex justify-center space-x-4">
+                        <button
+                        onClick={() => setIsConfirmModalOpen(false)}
+                        className="px-6 py-2 bg-gray-500 text-white font-semibold rounded-xl hover:bg-gray-600"
+                        >
+                        Cancel
+                        </button>
+                        <button
+                        onClick={performNewAttendance}
+                        className="px-6 py-2 bg-red-600 text-white font-semibold rounded-xl hover:bg-red-700"
+                        >
+                        Confirm
+                        </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+        
+              {/* Summary Modal */}
+              {isSummaryModalOpen && (
+                <div className="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full flex items-center justify-center">
+                  <div className="relative bg-white p-8 rounded-2xl shadow-2xl max-w-md mx-auto">
+                    <h3 className="text-2xl font-bold text-red-700 mb-4">Attendance Summary</h3>
+                    <p className="text-xl text-gray-700 font-semibold mb-4">Total Present: {presentMembers.length} / {members.length}</p>
+                    <hr className="my-4" />
+                    <div className="max-h-64 overflow-y-auto">
+                        <ul className="space-y-2">
+                            {presentMembers.length > 0 ? presentMembers.map((name, index) => (
+                                <li key={index} className="bg-gray-100 p-3 rounded-lg text-gray-800 font-medium">
+                                    {name}
+                                </li>
+                            )) : (
+                                <li className="text-gray-500 italic">No members have been scanned yet.</li>
+                            )}
+                        </ul>
+                    </div>
+                    <div className="mt-6 text-center">
+                        <button
+                        onClick={() => setIsSummaryModalOpen(false)}
+                        className="px-6 py-2 bg-red-600 text-white font-semibold rounded-xl hover:bg-red-700"
+                        >
+                        Close
+                        </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+        
+              {/* Database Modal */}
+              {isDatabaseModalOpen && (
+                <div className="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full flex items-center justify-center">
+                  <div className="relative bg-white p-8 rounded-2xl shadow-2xl max-w-2xl w-full mx-auto">
+                    <div className="flex justify-between items-center mb-4">
+                        <h3 className="text-2xl font-bold text-red-700">Member Database ({members.length})</h3>
+                        <button onClick={() => setIsDatabaseModalOpen(false)} className="text-gray-500 hover:text-gray-700 text-2xl font-bold">
+                            &times;
+                        </button>
+                    </div>
+                    <hr className="my-4" />
+                    <div className="max-h-96 overflow-y-auto">
+                        <ul className="space-y-2 pr-2">
+                            {members.length > 0 ? members.map(member => (
+                                <li key={member.id} className="bg-gray-50 p-3 rounded-xl border border-gray-100 text-sm flex justify-between items-center">
+                                    {editingMemberId === member.id ? (
+                                        <div className="flex-grow space-y-2">
+                                            <input
+                                                type="text"
+                                                value={editedName}
+                                                onChange={(e) => setEditedName(e.target.value)}
+                                                className="w-full p-1 rounded border border-gray-300 text-sm"
+                                            />
+                                            <input
+                                                type="text"
+                                                value={editedRfid}
+                                                onChange={(e) => setEditedRfid(e.target.value)}
+                                                className="w-full p-1 rounded border border-gray-300 text-sm"
+                                            />
+                                            <select
+                                                value={editedVoice}
+                                                onChange={(e) => setEditedVoice(e.target.value)}
+                                                className="w-full p-1 rounded border border-gray-300 bg-white text-sm"
+                                            >
+                                                <option value="Soprano">Soprano</option>
+                                                <option value="Alto">Alto</option>
+                                                <option value="Tenor">Tenor</option>
+                                                <option value="Bass">Bass</option>
+                                            </select>
+                                            <div className="flex space-x-2 mt-2">
+                                                <button onClick={() => handleSaveMember(member.id)} className="text-xs font-semibold text-green-600 hover:text-green-800">
+                                                    Save
+                                                </button>
+                                                <button onClick={() => setEditingMemberId(null)} className="text-xs font-semibold text-gray-500 hover:text-gray-700">
+                                                    Cancel
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <div className="flex-grow">
+                                            <div className="font-medium text-gray-900">{member.name} ({member.voice})</div>
+                                            <div className="font-mono text-gray-500 text-xs">RFID: {member.rfidId}</div>
+                                        </div>
+                                    )}
+                                    {editingMemberId !== member.id && (
+                                        <div className="flex space-x-2">
+                                            <button onClick={() => handleEditMember(member)} className="text-red-500 hover:text-red-700">
+                                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                                    <path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zm-3.586 3.586l-4 4V13h2.414l4-4-2.828-2.828z" />
+                                                    <path fillRule="evenodd" d="M12.793 6.793L15 9l-3.207 3.207a1 1 0 01-.707.293H7a1 1 0 01-1-1v-4a1 1 0 01.293-.707l3.207-3.207a1 1 0 011.414 0l.707.707zm-5.707 5.707l2.828 2.828-4.243 4.243a1 1 0 01-1.414 0l-1.414-1.414a1 1 0 010-1.414l4.243-4.243zM15 15a1 1 0 00-1-1H4a1 1 0 00-1 1v4a1 1 0 001 1h10a1 1 0 001-1v-4z" clipRule="evenodd" />
+                                                </svg>
+                                            </button>
+                                            <button onClick={() => handleDeleteMember(member.id)} className="text-red-500 hover:text-red-700">
+                                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                                    <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                                                </svg>
+                                            </button>
+                                        </div>
+                                    )}
+                                </li>
+                            )) : (
+                                <li className="text-gray-500 italic">No members have been added to the database.</li>
+                            )}
+                        </ul>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        };
+        const container = document.getElementById('root');
+        const root = createRoot(container);
+        root.render(App());
+    </script>
+</body>
+</html>
